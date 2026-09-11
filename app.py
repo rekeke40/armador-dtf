@@ -6,6 +6,7 @@ red para poder usarse tambien desde el celular o el iPad de la misma WiFi.
 
 import base64
 import io
+import ipaddress
 import os
 import socket
 import time
@@ -38,16 +39,43 @@ MASK_CACHE = {}   # (maskKey, dpi, choke, thr) -> dataurl
 ALLOWED = {".png", ".tif", ".tiff", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
-def lan_ip():
-    """IP de esta PC en la red local (para conectarse desde el celular)."""
+def lan_ips():
+    """IPs de esta PC en la red local, la mas probable primero.
+
+    Ojo: con una VPN activa (NordVPN, etc.) la ruta por defecto apunta al tunel,
+    asi que no basta con preguntar "por donde saldria a internet" — esa direccion
+    no es alcanzable desde el celular. Por eso se enumeran todas y se ordenan:
+    192.168.x.x primero (router tipico), y al final los adaptadores virtuales,
+    que casi siempre se asignan a si mismos el .1
+    """
+    found = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.add(info[4][0])
+    except Exception:
+        pass
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))   # no envia nada: solo resuelve la ruta
-        return s.getsockname()[0]
+        found.add(s.getsockname()[0])
     except Exception:
-        return "127.0.0.1"
+        pass
     finally:
         s.close()
+
+    ranked = []
+    for ip in found:
+        try:
+            a = ipaddress.IPv4Address(ip)
+        except ValueError:
+            continue
+        if not a.is_private or a.is_loopback or a.is_link_local:
+            continue
+        rank = (0 if ip.startswith("192.168.") else 1 if ip.startswith("172.") else 2,
+                1 if ip.rsplit(".", 1)[1] == "1" else 0, ip)
+        ranked.append((rank, ip))
+    ranked.sort()
+    return [ip for _, ip in ranked] or ["127.0.0.1"]
 
 
 def default_output_dir():
@@ -65,11 +93,13 @@ def index():
 @app.get("/api/config")
 def config():
     profile = exporter.find_cmyk_profile()
+    ips = lan_ips()
     return jsonify({
         "output_dir": default_output_dir(),
         "cmyk_profile": os.path.basename(profile) if profile else None,
         "cmyk_profile_custom": exporter.is_custom_cmyk_profile(),
-        "lan_url": f"http://{lan_ip()}:{PORT}",
+        "lan_url": f"http://{ips[0]}:{PORT}",
+        "lan_alternativas": [f"http://{ip}:{PORT}" for ip in ips[1:]],
         "is_server_pc": request.remote_addr in ("127.0.0.1", "::1"),
     })
 
@@ -330,13 +360,15 @@ def quitar():
 
 if __name__ == "__main__":
     url_local = f"http://127.0.0.1:{PORT}"
-    url_lan = f"http://{lan_ip()}:{PORT}"
+    ips = lan_ips()
     print("\n" + "=" * 58)
     print("  ARMADOR DTF esta corriendo")
     print("=" * 58)
     print(f"  En esta PC ......... {url_local}")
-    print(f"  Celular / iPad ..... {url_lan}")
-    print("  (la misma red WiFi; cierra esta ventana para apagarlo)")
+    print(f"  Celular / iPad ..... http://{ips[0]}:{PORT}")
+    for extra in ips[1:]:
+        print(f"     (si no abre, prueba  http://{extra}:{PORT})")
+    print("  La misma red WiFi. Cierra esta ventana para apagarlo.")
     print("=" * 58 + "\n")
     Timer(1.2, lambda: webbrowser.open(url_local)).start()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)

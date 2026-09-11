@@ -266,13 +266,15 @@ $("btnLiberar").onclick = () => {
 };
 
 $("btnInfo").onclick = () => {
+  const alts = (cfg.lan_alternativas || []).map(u => `<code>${esc(u)}</code>`).join(" ");
   showModal("📱 Abrir en el celular o el iPad", `
     <p>Conecta el dispositivo a <strong>la misma red WiFi</strong> que esta PC y abre
     esta dirección en su navegador:</p>
     <p><code>${esc(cfg.lan_url || "—")}</code></p>
-    <p>La plancha se genera y se guarda siempre <strong>en esta PC</strong> (donde está
-    el RIP); desde el celular puedes armar, revisar y exportar, y descargar el archivo
-    si lo necesitas.</p>
+    ${alts ? `<p style="margin-top:8px">Si esa no abre, esta PC también responde en:<br>${alts}</p>` : ""}
+    <p style="margin-top:10px">La plancha se genera y se guarda siempre <strong>en esta
+    PC</strong> (donde está el RIP); desde el celular puedes armar, revisar y exportar,
+    y descargar el archivo si lo necesitas.</p>
     <p style="margin-top:10px">Cualquiera en esa red puede abrir el programa, así que
     úsalo solo en la WiFi de tu taller.</p>`);
 };
