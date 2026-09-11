@@ -21,6 +21,17 @@ let pendingFocus = null;  // {i, f} celda a enfocar tras re-render (Enter)
 
 const $ = (id) => document.getElementById(id);
 
+// Si la sesión caduca, cualquier llamada devuelve 401: volver al PIN.
+const _fetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const res = await _fetch(...args);
+  if (res.status === 401 && String(args[0]).startsWith("/api/")) {
+    location.href = "/login";
+    throw new Error("Sesión expirada");
+  }
+  return res;
+};
+
 fetch("/api/config").then(r => r.json()).then(c => {
   cfg = c;
   outputDir = c.output_dir;
@@ -267,16 +278,20 @@ $("btnLiberar").onclick = () => {
 
 $("btnInfo").onclick = () => {
   const alts = (cfg.lan_alternativas || []).map(u => `<code>${esc(u)}</code>`).join(" ");
-  showModal("📱 Abrir en el celular o el iPad", `
-    <p>Conecta el dispositivo a <strong>la misma red WiFi</strong> que esta PC y abre
-    esta dirección en su navegador:</p>
+  const pub = cfg.url_publica
+    ? `<p><strong>Desde cualquier lugar</strong> (internet, datos móviles):</p>
+       <p><code>${esc(cfg.url_publica)}</code></p>
+       <p style="margin-top:6px">Esta dirección cambia cada vez que reinicias el
+       programa. Vuelve aquí para ver la nueva.</p><hr style="border-color:var(--border);margin:14px 0">`
+    : `<p style="margin-bottom:14px">El túnel no está activo: por ahora solo funciona
+       en tu red. Ábrelo con <strong>Armador DTF (con internet)</strong>.</p>`;
+  showModal("📱 Abrir en otro dispositivo", `
+    ${pub}
+    <p><strong>En la misma WiFi</strong> que esta PC:</p>
     <p><code>${esc(cfg.lan_url || "—")}</code></p>
-    ${alts ? `<p style="margin-top:8px">Si esa no abre, esta PC también responde en:<br>${alts}</p>` : ""}
-    <p style="margin-top:10px">La plancha se genera y se guarda siempre <strong>en esta
-    PC</strong> (donde está el RIP); desde el celular puedes armar, revisar y exportar,
-    y descargar el archivo si lo necesitas.</p>
-    <p style="margin-top:10px">Cualquiera en esa red puede abrir el programa, así que
-    úsalo solo en la WiFi de tu taller.</p>`);
+    ${alts ? `<p style="margin-top:8px">Si esa no abre, también responde en:<br>${alts}</p>` : ""}
+    <p style="margin-top:12px">En ambos casos pide el PIN. La plancha siempre se genera
+    y se guarda <strong>en esta PC</strong>, que es donde está el RIP.</p>`);
 };
 
 // ---------- acomodo ----------

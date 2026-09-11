@@ -18,17 +18,43 @@ Funciona en la PC, y desde el celular o el iPad conectados a la misma WiFi.
 4. La plancha se acomoda sola y ves la vista previa con el largo total.
 5. **Exportar plancha** → el archivo queda en `Escritorio\Planchas DTF`.
 
+### Hay dos formas de arrancarlo
+
+| Acceso directo | Qué hace |
+|---|---|
+| **Armador DTF** | Solo en esta PC y en la WiFi del taller. |
+| **Armador DTF (con internet)** | Además abre un túnel de Cloudflare y te da una dirección `https://` que funciona desde cualquier parte. |
+
+En ambos casos el programa pide un **PIN** antes de dejar entrar. El PIN se
+genera solo la primera vez y se guarda en `config.json`; aparece en la ventana
+negra al arrancar. Para cambiarlo, edita ese archivo o pon la variable de
+entorno `ARMADOR_PIN`. La sesión dura 30 días por dispositivo, así que el PIN se
+escribe una sola vez en cada celular.
+
 ### Desde el celular o el iPad
 
-Toca el botón **📱** en la barra de arriba: te muestra la dirección que hay que
-abrir en el navegador del dispositivo (algo como `http://192.168.1.50:8765`).
-Tiene que estar en la misma WiFi que la PC.
+Toca el botón **📱** en la barra de arriba: muestra las direcciones disponibles,
+la pública (si el túnel está activo) y la de la WiFi.
 
 La plancha siempre se genera y se guarda **en la PC**, que es donde está el RIP.
 Desde el celular puedes armar, revisar, exportar y descargar el archivo.
 
-> Cualquiera en esa red puede abrir el programa, así que úsalo en la WiFi de tu
-> taller, no en una red pública.
+> La dirección `https://…trycloudflare.com` **cambia cada vez que reinicias el
+> programa**. Para una dirección fija hace falta un dominio propio en Cloudflare
+> (unos 10 USD al año).
+
+### Qué protege el programa cuando está publicado
+
+- Todo exige el PIN; tras 5 intentos fallidos hay bloqueo temporal creciente.
+- Solo se leen y escriben archivos dentro de `Escritorio\Planchas DTF`. Cualquier
+  otra ruta enviada por el navegador se ignora.
+- "Abrir carpeta" solo funciona desde el navegador de la propia PC; por internet
+  se rechaza.
+- El túnel nunca cuenta como "PC local", aunque cloudflared se conecte desde
+  `127.0.0.1`.
+
+**`config.json` contiene tu PIN y la llave de sesión: no lo subas a GitHub.**
+Ya está en `.gitignore`.
 
 ## Hoja de diseños
 

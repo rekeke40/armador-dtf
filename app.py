@@ -5,18 +5,23 @@ red para poder usarse tambien desde el celular o el iPad de la misma WiFi.
 """
 
 import base64
+import hmac
 import io
 import ipaddress
+import json
 import os
+import secrets
 import socket
 import time
 import uuid
 import webbrowser
-from collections import Counter
+from collections import Counter, defaultdict
+from functools import wraps
 from pathlib import Path
 from threading import Timer
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import (Flask, jsonify, redirect, request, send_from_directory,
+                   session, url_for)
 from werkzeug.utils import secure_filename
 
 from engine import packer, exporter
@@ -32,6 +37,113 @@ HOST = os.environ.get("ARMADOR_HOST", "0.0.0.0")
 
 app = Flask(__name__, static_folder=str(APP_DIR / "static"), static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+
+
+# ==========================================================================
+# Seguridad
+#
+# El programa puede publicarse en internet con un tunel de Cloudflare, asi que
+# no puede confiar en "la red local es de confianza". Tres reglas:
+#   1. Todo pasa por un PIN. La sesion dura 30 dias por dispositivo.
+#   2. Los archivos solo se leen y escriben dentro de la carpeta de salida.
+#   3. Una peticion que llega por el tunel NUNCA cuenta como local, aunque
+#      cloudflared se conecte desde 127.0.0.1.
+# ==========================================================================
+
+CONFIG_FILE = APP_DIR / "config.json"
+
+
+def load_config():
+    """Lee (o crea) la configuracion local con el PIN y la llave de sesion."""
+    if CONFIG_FILE.is_file():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+            if cfg.get("pin") and cfg.get("secret_key"):
+                return cfg
+        except (json.JSONDecodeError, OSError):
+            pass
+    cfg = {"pin": f"{secrets.randbelow(10**6):06d}",
+           "secret_key": secrets.token_hex(32)}
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), "utf-8")
+    return cfg
+
+
+CONFIG = load_config()
+PIN = str(os.environ.get("ARMADOR_PIN") or CONFIG["pin"])
+app.secret_key = CONFIG["secret_key"]
+app.config.update(PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 30,
+                  SESSION_COOKIE_HTTPONLY=True,
+                  SESSION_COOKIE_SAMESITE="Lax")
+
+_login_fails = defaultdict(list)   # ip -> timestamps de intentos fallidos
+
+
+def client_is_local():
+    """True solo si el navegador esta en esta misma PC.
+
+    cloudflared se conecta desde 127.0.0.1, asi que la direccion de origen no
+    basta: si vienen cabeceras de proxy, la peticion llego desde fuera.
+    """
+    if request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For"):
+        return False
+    return request.remote_addr in ("127.0.0.1", "::1")
+
+
+def client_key():
+    return (request.headers.get("CF-Connecting-IP")
+            or (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            or request.remote_addr or "?")
+
+
+def login_blocked(key):
+    """Bloqueo temporal tras varios intentos fallidos (anti fuerza bruta)."""
+    now = time.time()
+    recent = [t for t in _login_fails[key] if now - t < 900]
+    _login_fails[key] = recent
+    if len(recent) < 5:
+        return 0
+    espera = min(300, 30 * (len(recent) - 4))
+    restante = espera - (now - recent[-1])
+    return max(0, int(restante))
+
+
+@app.before_request
+def require_login():
+    ruta = request.path
+    if ruta in ("/login", "/api/login", "/login.html", "/style.css") or ruta.startswith("/static/"):
+        return None
+    if session.get("ok"):
+        return None
+    if ruta.startswith("/api/"):
+        return jsonify({"error": "Sesión expirada", "login": True}), 401
+    return redirect(url_for("login_page"))
+
+
+@app.get("/login")
+def login_page():
+    return send_from_directory(app.static_folder, "login.html")
+
+
+@app.post("/api/login")
+def api_login():
+    key = client_key()
+    espera = login_blocked(key)
+    if espera:
+        return jsonify({"error": f"Demasiados intentos. Espera {espera} s."}), 429
+    pin = str((request.json or {}).get("pin", ""))
+    if hmac.compare_digest(pin, PIN):
+        _login_fails.pop(key, None)
+        session.permanent = True
+        session["ok"] = True
+        return jsonify({"ok": True})
+    _login_fails[key].append(time.time())
+    return jsonify({"error": "PIN incorrecto"}), 401
+
+
+@app.post("/api/logout")
+def api_logout():
+    session.clear()
+    return jsonify({"ok": True})
 
 DESIGNS = {}      # id -> {path, name, w_px, h_px}
 MASK_CACHE = {}   # (maskKey, dpi, choke, thr) -> dataurl
@@ -85,6 +197,40 @@ def default_output_dir():
     return str(Path.home() / "Planchas DTF")
 
 
+OUTPUT_BASE = Path(os.environ.get("ARMADOR_SALIDA") or default_output_dir()).resolve()
+
+TUNNEL_FILE = APP_DIR / "tunnel_url.txt"
+
+
+def read_tunnel_url():
+    """URL publica del tunel, que el lanzador escribe al arrancar cloudflared."""
+    try:
+        # utf-8-sig: PowerShell escribe el archivo con BOM y sin esto la URL
+        # llegaria con un caracter invisible delante
+        url = TUNNEL_FILE.read_text("utf-8-sig").strip()
+        return url if url.startswith("https://") else None
+    except OSError:
+        return None
+
+
+def safe_output_dir(requested=None):
+    """Resuelve la carpeta de salida sin dejar salir de OUTPUT_BASE.
+
+    Sin esto, un parametro `output_dir` o `dir` enviado por el navegador podria
+    escribir o leer cualquier ruta de la PC — inaceptable con el programa
+    publicado en internet.
+    """
+    if not requested:
+        return OUTPUT_BASE
+    try:
+        p = Path(requested).resolve()
+    except (OSError, ValueError):
+        return OUTPUT_BASE
+    if p == OUTPUT_BASE or OUTPUT_BASE in p.parents:
+        return p
+    return OUTPUT_BASE
+
+
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -95,12 +241,13 @@ def config():
     profile = exporter.find_cmyk_profile()
     ips = lan_ips()
     return jsonify({
-        "output_dir": default_output_dir(),
+        "output_dir": str(OUTPUT_BASE),
         "cmyk_profile": os.path.basename(profile) if profile else None,
         "cmyk_profile_custom": exporter.is_custom_cmyk_profile(),
         "lan_url": f"http://{ips[0]}:{PORT}",
         "lan_alternativas": [f"http://{ip}:{PORT}" for ip in ips[1:]],
-        "is_server_pc": request.remote_addr in ("127.0.0.1", "::1"),
+        "is_server_pc": client_is_local(),
+        "url_publica": read_tunnel_url(),
     })
 
 
@@ -270,7 +417,7 @@ def export():
             return jsonify({"error": "No hay diseños que exportar"}), 400
 
         dpi = s["dpi"]
-        out_dir = Path(payload.get("output_dir") or default_output_dir())
+        out_dir = safe_output_dir(payload.get("output_dir"))
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -328,21 +475,22 @@ def export():
 @app.get("/api/descargar")
 def descargar():
     """Descarga un archivo ya exportado (util desde el celular o el iPad)."""
-    folder = request.args.get("dir") or default_output_dir()
+    folder = safe_output_dir(request.args.get("dir"))
     name = secure_filename(request.args.get("name") or "")
-    if not name or not Path(folder, name).is_file():
+    if not name or not (folder / name).is_file():
         return jsonify({"error": "Archivo no encontrado"}), 404
-    return send_from_directory(folder, name, as_attachment=True)
+    return send_from_directory(str(folder), name, as_attachment=True)
 
 
 @app.post("/api/abrir-carpeta")
 def abrir_carpeta():
-    """Abre la carpeta en el explorador. Solo tiene sentido en la PC servidor."""
-    if request.remote_addr not in ("127.0.0.1", "::1"):
-        return jsonify({"ok": False, "error": "Solo disponible en la PC del programa"}), 400
-    folder = (request.json or {}).get("dir") or default_output_dir()
-    if os.path.isdir(folder):
-        os.startfile(folder)
+    """Abre la carpeta en el explorador. Solo desde el navegador de esta PC."""
+    if not client_is_local():
+        return jsonify({"ok": False,
+                        "error": "Solo disponible en la PC del programa"}), 403
+    folder = safe_output_dir((request.json or {}).get("dir"))
+    if folder.is_dir():
+        os.startfile(str(folder))
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "La carpeta no existe"}), 404
 
@@ -359,11 +507,15 @@ def quitar():
 
 
 if __name__ == "__main__":
+    # el lanzador con tunel lo reescribe despues; asi nunca se muestra una
+    # direccion publica vieja que ya no responde
+    TUNNEL_FILE.unlink(missing_ok=True)
     url_local = f"http://127.0.0.1:{PORT}"
     ips = lan_ips()
     print("\n" + "=" * 58)
     print("  ARMADOR DTF esta corriendo")
     print("=" * 58)
+    print(f"  PIN de acceso ...... {PIN}")
     print(f"  En esta PC ......... {url_local}")
     print(f"  Celular / iPad ..... http://{ips[0]}:{PORT}")
     for extra in ips[1:]:

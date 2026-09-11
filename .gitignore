@@ -3,6 +3,14 @@ uploads/
 *.pyc
 __pycache__/
 
+# PIN y llave de sesion: NUNCA se publican
+config.json
+
+# Estado del tunel
+tunnel_url.txt
+tunnel.log
+tunnel.log.out
+
 # Perfiles ICC: suelen tener licencia del fabricante, no se publican
 perfiles/*.icc
 perfiles/*.icm
