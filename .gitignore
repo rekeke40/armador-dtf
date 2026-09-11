@@ -1,0 +1,20 @@
+# Archivos de trabajo del programa
+uploads/
+*.pyc
+__pycache__/
+
+# Perfiles ICC: suelen tener licencia del fabricante, no se publican
+perfiles/*.icc
+perfiles/*.icm
+
+# Planchas generadas
+*.tif
+*.tiff
+Planchas DTF/
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store
+.venv/
+venv/
