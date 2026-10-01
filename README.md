@@ -5,7 +5,7 @@ Acomoda los diseños de un pedido en el ancho del rollo, calcula el largo de
 película y entrega un TIFF CMYK + White listo para el RIP. Sustituye el armado
 manual en Photoshop o iCore.
 
-![Pruebas](https://github.com/rokeke40/armador-dtf/actions/workflows/pruebas.yml/badge.svg)
+![Pruebas](https://github.com/rekeke40/armador-dtf/actions/workflows/pruebas.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)
 ![RIP](https://img.shields.io/badge/RIP-MainTop%206.1-555)
