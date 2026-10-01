@@ -16,6 +16,8 @@ let lastScale = 1;
 let whiteView = false;
 let whiteMasks = {};      // maskKey -> dataURL de la máscara roja
 let selected = null;      // {p, el} pieza seleccionada en la plancha
+let arrastrando = false;  // hay una pieza en la mano ahora mismo
+let redibujoPendiente = false;
 let uidSeq = 1, lockSeq = 1;
 let pendingFocus = null;  // {i, f} celda a enfocar tras re-render (Enter)
 
@@ -36,7 +38,7 @@ fetch("/api/config").then(r => r.json()).then(c => {
   cfg = c;
   outputDir = c.output_dir;
   if (!c.is_server_pc) $("btnCarpeta").style.display = "none";
-  updateFormatUI();
+  updateCmykWarn();
 }).catch(() => {});
 
 // ---------- pestañas (celular) ----------
@@ -84,9 +86,11 @@ async function uploadFiles(files) {
       rows.push({
         uid: "u" + (uidSeq++), id: d.id, name: d.name, thumb: d.thumb,
         aspect, w_cm: round2(w), h_cm: round2(w * aspect), qty: 1,
+        borde_suave: d.borde_suave || 0,
       });
     }
     renderTable();
+    avisoBordes();
     scheduleLayout();
     toast(errors.length ? errors.join(" · ") : `${list.length} diseño(s) agregado(s)`);
   } catch (e) {
@@ -193,6 +197,7 @@ function removeRow(i) {
     for (const k of Object.keys(whiteMasks)) if (k.startsWith(d.id + "_")) delete whiteMasks[k];
   }
   renderTable();
+  avisoBordes();
   scheduleLayout();
 }
 
@@ -219,6 +224,38 @@ function renderTotals() {
     : "";
 }
 
+// Aviso de bordes casi transparentes.
+//
+// En DTF esas zonas reciben poca tinta, retienen poco polvo adhesivo y son las
+// que se despegan o se van en el primer lavado. El servidor mide, al subir el
+// archivo, qué parte del arte cae en esa franja; aquí solo se avisa cuando la
+// cifra es alta y "Limpiar bordes" sigue apagado.
+const BORDE_RIESGO = 10;      // % del arte a partir del cual vale la pena avisar
+
+function avisoBordes() {
+  const caja = $("bordeWarn");
+  const umbral = parseInt($("setThreshold").value) || 0;
+  const malos = rows.filter(d => (d.borde_suave || 0) >= BORDE_RIESGO);
+  if (!malos.length || umbral >= 15) {
+    caja.classList.add("hidden");
+    return;
+  }
+  malos.sort((a, b) => b.borde_suave - a.borde_suave);
+  const peor = malos[0];
+  const otros = malos.length > 1 ? ` (y ${malos.length - 1} más)` : "";
+  caja.innerHTML =
+    `⚠ <strong>${esc(peor.name)}</strong>${esc(otros)}: el ${peor.borde_suave} % de su arte son ` +
+    `bordes casi transparentes. En DTF esas zonas retienen poco polvo y se despegan al lavar. ` +
+    `<button id="btnLimpiar20" class="secondary">Limpiar bordes al 20 %</button>`;
+  caja.classList.remove("hidden");
+  $("btnLimpiar20").onclick = () => {
+    $("setThreshold").value = 20;
+    $("setThreshold").dispatchEvent(new Event("change"));
+    avisoBordes();
+    toast("Bordes por debajo del 20 % de opacidad: fuera de la plancha");
+  };
+}
+
 // ---------- ajustes ----------
 function sheetSettings() {
   return {
@@ -230,6 +267,7 @@ function sheetSettings() {
     alpha_threshold: parseInt($("setThreshold").value) || 0,
     allow_rotate: $("setRotate").checked,
     mirror: $("setMirror").checked,
+    con_blanco: $("setConBlanco").checked,
     intent: $("setIntent").value,
   };
 }
@@ -246,22 +284,26 @@ function payload() {
   $(id).addEventListener("change", scheduleLayout));
 ["setDpi", "setChoke", "setThreshold"].forEach(id =>
   $(id).addEventListener("change", () => {
-    whiteMasks = {};                      // las máscaras dependen de DPI, choke y umbral
+    whiteMasks = {};
     if (whiteView) ensureMasks();
   }));
-$("setFormat").addEventListener("change", updateFormatUI);
+$("setThreshold").addEventListener("change", avisoBordes);
 
-function updateFormatUI() {
-  const isCmyk = $("setFormat").value.startsWith("cmyk");
-  $("settings").classList.toggle("rgb-mode", !isCmyk);
+$("setConBlanco").addEventListener("change", () => {
+  const on = $("setConBlanco").checked;
+  $("whiteControls").style.display = on ? "" : "none";
+  if (!on && whiteView) {
+    whiteView = false;
+    $("btnWhite").classList.remove("active");
+    if (lastData) drawSheet();
+  }
+});
+
+function updateCmykWarn() {
   const warn = $("cmykWarn");
-  if (isCmyk && cfg.cmyk_profile && !cfg.cmyk_profile_custom) {
-    warn.textContent = `⚠ Convirtiendo con ${cfg.cmyk_profile} (perfil de imprenta offset, no de DTF). ` +
-      `Apaga los azules, verdes y naranjas saturados de forma irreversible. ` +
-      `Usa "TIFF RGB + alpha" o pon tu perfil en perfiles/cmyk.icc.`;
-    warn.classList.remove("hidden");
-  } else if (isCmyk && !cfg.cmyk_profile) {
-    warn.textContent = "⚠ No hay perfil CMYK instalado: la conversión será aproximada.";
+  if (!cfg.cmyk_profile) {
+    warn.textContent = "⚠ No hay perfil CMYK instalado: la conversión será aproximada. " +
+                       "Pon tu perfil en perfiles/cmyk.icc.";
     warn.classList.remove("hidden");
   } else {
     warn.classList.add("hidden");
@@ -276,23 +318,67 @@ $("btnLiberar").onclick = () => {
   doLayout();
 };
 
-$("btnInfo").onclick = () => {
+$("btnInfo").onclick = async () => {
+  try { cfg = await (await fetch("/api/config")).json(); } catch (_) { /* con lo que haya */ }
+  modalRed();
+};
+
+// Modal de "abrir en otro dispositivo": direcciones, PIN y el túnel.
+// El PIN se muestra aquí porque la app de escritorio ya no tiene ventana negra
+// donde leerlo, y sin él no se puede entrar desde el celular.
+function modalRed() {
   const alts = (cfg.lan_alternativas || []).map(u => `<code>${esc(u)}</code>`).join(" ");
   const pub = cfg.url_publica
     ? `<p><strong>Desde cualquier lugar</strong> (internet, datos móviles):</p>
        <p><code>${esc(cfg.url_publica)}</code></p>
-       <p style="margin-top:6px">Esta dirección cambia cada vez que reinicias el
-       programa. Vuelve aquí para ver la nueva.</p><hr style="border-color:var(--border);margin:14px 0">`
-    : `<p style="margin-bottom:14px">El túnel no está activo: por ahora solo funciona
-       en tu red. Ábrelo con <strong>Armador DTF (con internet)</strong>.</p>`;
+       <p class="nota">Esta dirección cambia cada vez que abres el túnel.</p>`
+    : `<p>Ahora mismo <strong>solo funciona en tu red</strong>.</p>`;
+
+  let boton = "";
+  if (cfg.is_server_pc && cfg.tunel_disponible) {
+    boton = `<p style="margin-top:10px"><button id="btnTunel" class="secondary">${
+      cfg.url_publica ? "⏹ Cerrar el túnel" : "🌐 Publicar en internet"}</button></p>`;
+  } else if (cfg.is_server_pc) {
+    boton = `<p class="nota" style="margin-top:10px">Para publicarlo en internet hace
+             falta <code>cloudflared.exe</code> en la carpeta del programa.</p>`;
+  }
+
   showModal("📱 Abrir en otro dispositivo", `
     ${pub}
+    ${boton}
+    <hr style="border-color:var(--border);margin:14px 0">
     <p><strong>En la misma WiFi</strong> que esta PC:</p>
     <p><code>${esc(cfg.lan_url || "—")}</code></p>
     ${alts ? `<p style="margin-top:8px">Si esa no abre, también responde en:<br>${alts}</p>` : ""}
-    <p style="margin-top:12px">En ambos casos pide el PIN. La plancha siempre se genera
-    y se guarda <strong>en esta PC</strong>, que es donde está el RIP.</p>`);
-};
+    ${cfg.pin ? `<p style="margin-top:12px">PIN para entrar desde el celular o el iPad:<br>
+       <code style="font-size:1.4em;letter-spacing:.14em">${esc(cfg.pin)}</code></p>` : ""}
+    <p class="nota" style="margin-top:12px">En esta PC no pide PIN. La plancha siempre se
+    genera y se guarda <strong>aquí</strong>, que es donde está el RIP.</p>`);
+
+  const btn = $("btnTunel");
+  if (btn) btn.onclick = () => alternarTunel(btn);
+}
+
+async function alternarTunel(btn) {
+  const abriendo = !cfg.url_publica;
+  if (abriendo && !confirm(
+      "Se va a publicar el programa en internet con una dirección de Cloudflare.\n\n" +
+      "Cualquiera que tenga el enlace Y el PIN podrá entrar mientras el túnel " +
+      "esté abierto.\n\n¿Continuar?")) return;
+  btn.disabled = true;
+  btn.textContent = abriendo ? "Abriendo el túnel…" : "Cerrando…";
+  try {
+    const r = await fetch("/api/tunel", jsonReq({ accion: abriendo ? "abrir" : "cerrar" }));
+    const d = await r.json();
+    if (d.error) { toast("⚠ " + d.error); btn.disabled = false; modalRed(); return; }
+    cfg.url_publica = d.url || null;
+    toast(abriendo ? "🌐 Publicado en internet" : "⏹ Túnel cerrado");
+    modalRed();
+  } catch (e) {
+    toast("⚠ No se pudo cambiar el túnel: " + e.message);
+    btn.disabled = false;
+  }
+}
 
 // ---------- acomodo ----------
 function scheduleLayout() {
@@ -307,6 +393,7 @@ async function doLayout() {
     const res = await fetch("/api/layout", { ...jsonReq(payload()), signal: layoutAbort.signal });
     const data = await res.json();
     if (data.error) { toast("⚠ " + data.error); return; }
+    sincronizarFijadas(data);
     lastData = data;
     drawSheet();
     renderTotals();
@@ -316,8 +403,25 @@ async function doLayout() {
   }
 }
 
+// El servidor es el que manda: si soltó una pieza fijada (ya no cabe, se
+// encimaba con otra o su fila cambió) hay que soltarla aquí también, o la
+// vista previa mostraría piezas que la plancha exportada no va a llevar.
+function sincronizarFijadas(data) {
+  const vivas = new Map();
+  for (const p of data.placements || []) if (p.locked) vivas.set(p.key, p);
+  const sueltas = pruneLocks(l => vivas.has(l.key));
+  for (const l of locks) {
+    const p = vivas.get(l.key);
+    if (p) { l.x = p.x; l.y = p.y; }   // el servidor pudo recorrerla al borde
+  }
+  if (sueltas) toast(`🔓 ${sueltas} pieza(s) fijada(s) volvieron al acomodo automático`);
+}
+
 // ---------- vista previa ----------
 function drawSheet() {
+  // redibujar en pleno arrastre destruiría la pieza que el usuario tiene
+  // agarrada y el arrastre se quedaría a medias
+  if (arrastrando) { redibujoPendiente = true; return; }
   const data = lastData;
   const s = sheetSettings();
   const sheet = $("sheet");
@@ -363,9 +467,11 @@ function drawSheet() {
     sheet.appendChild(el);
   }
   const nLocked = data.placements.filter(p => p.locked).length;
-  $("statInfo").textContent = `${data.placements.length} piezas` +
+  const faltan = (data.pedidas || 0) - data.placements.length;
+  $("statInfo").textContent =
+    `${data.placements.length}${faltan > 0 ? ` de ${data.pedidas}` : ""} piezas` +
     (nLocked ? ` · 📌 ${nLocked} fijada(s)` : "") +
-    (data.too_big.length ? ` · ⚠ ${data.too_big.length} no caben en el ancho` : "");
+    (faltan > 0 ? ` · ⚠ ${faltan} no caben en el ancho` : "");
   $("statLen").textContent = `Largo: ${data.length_cm} cm`;
 }
 
@@ -433,48 +539,74 @@ async function ensureMasks() {
 function pieceDown(e, p, el) {
   if (e.button !== undefined && e.button !== 0) return;
   e.preventDefault();
+  // Los listeners van en window y no en la pieza: setPointerCapture falla en
+  // algunos navegadores (y en iPad al re-dibujar la plancha), y sin captura la
+  // pieza dejaba de recibir pointermove en cuanto el dedo salía de ella — el
+  // arrastre se quedaba colgado y no se podía fijar nada.
   try { el.setPointerCapture(e.pointerId); } catch (_) { /* no crítico */ }
   const startX = e.clientX, startY = e.clientY;
   const origLeft = parseFloat(el.style.left), origTop = parseFloat(el.style.top);
   let moved = false;
+  let ultima = { x: origLeft, y: origTop };
+
+  const quitar = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", finish);
+    window.removeEventListener("pointercancel", cancelado);
+    arrastrando = false;
+    if (redibujoPendiente) { redibujoPendiente = false; drawSheet(); }
+  };
 
   const onMove = (ev) => {
+    if (ev.pointerId !== e.pointerId) return;
     const dx = ev.clientX - startX, dy = ev.clientY - startY;
-    if (!moved && Math.hypot(dx, dy) > 6) { moved = true; el.classList.add("dragging"); hideTools(); }
+    if (!moved && Math.hypot(dx, dy) > 6) {
+      moved = true; arrastrando = true;
+      el.classList.add("dragging"); hideTools();
+    }
     if (!moved) return;
-    el.style.left = (origLeft + dx) + "px";
-    el.style.top = (origTop + dy) + "px";
-    const pos = dropPosition(p, origLeft + dx, origTop + dy);
+    ev.preventDefault();
+    ultima = { x: origLeft + dx, y: origTop + dy };
+    el.style.left = ultima.x + "px";
+    el.style.top = ultima.y + "px";
+    const pos = dropPosition(p, ultima.x, ultima.y);
     el.classList.toggle("invalid", !!collidingLock(p, pos.x, pos.y));
   };
-  const finish = (ev) => {
-    el.removeEventListener("pointermove", onMove);
-    el.removeEventListener("pointerup", finish);
-    el.removeEventListener("pointercancel", cancel);
-    if (!moved) { selectPiece(p, el); return; }
+
+  const soltar = () => {
     el.classList.remove("dragging", "invalid");
-    const pos = dropPosition(p, origLeft + ev.clientX - startX, origTop + ev.clientY - startY);
-    const hit = collidingLock(p, pos.x, pos.y);
-    if (hit) {
+    const pos = dropPosition(p, ultima.x, ultima.y);
+    if (collidingLock(p, pos.x, pos.y)) {
       el.style.left = origLeft + "px";
       el.style.top = origTop + "px";
       toast("⚠ Ahí ya hay otra pieza fijada");
+      if (lastData) drawSheet();
       return;
     }
     upsertLock(p, pos.x, pos.y);
     doLayout();
   };
-  const cancel = () => {
-    el.removeEventListener("pointermove", onMove);
-    el.removeEventListener("pointerup", finish);
-    el.removeEventListener("pointercancel", cancel);
-    el.classList.remove("dragging", "invalid");
-    el.style.left = origLeft + "px";
-    el.style.top = origTop + "px";
+
+  const finish = (ev) => {
+    if (ev.pointerId !== e.pointerId) return;
+    quitar();
+    if (!moved) { selectPiece(p, el); return; }
+    soltar();
   };
-  el.addEventListener("pointermove", onMove);
-  el.addEventListener("pointerup", finish);
-  el.addEventListener("pointercancel", cancel);
+
+  // pointercancel lo dispara el navegador cuando se queda con el gesto (pasa
+  // en el iPad). Si la pieza ya se había movido, se respeta el último sitio
+  // válido en vez de tirar el arrastre a la basura.
+  const cancelado = (ev) => {
+    if (ev.pointerId !== e.pointerId) return;
+    quitar();
+    if (moved) soltar();
+    else { el.style.left = origLeft + "px"; el.style.top = origTop + "px"; }
+  };
+
+  window.addEventListener("pointermove", onMove, { passive: false });
+  window.addEventListener("pointerup", finish);
+  window.addEventListener("pointercancel", cancelado);
 }
 
 // convierte px de pantalla a cm dentro de la plancha, con topes
@@ -583,7 +715,6 @@ $("btnExportar").onclick = async () => {
   try {
     const body = payload();
     body.output_dir = outputDir;
-    body.format = $("setFormat").value;
     const res = await fetch("/api/export", jsonReq(body));
     const data = await res.json();
     if (data.error) { toast("⚠ " + data.error); return; }

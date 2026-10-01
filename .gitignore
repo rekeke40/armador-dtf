@@ -20,9 +20,17 @@ perfiles/*.icm
 *.tiff
 Planchas DTF/
 
+# Resultado de empaquetar el .exe
+build/
+dist/
+
 # Sistema
 Thumbs.db
 desktop.ini
 .DS_Store
 .venv/
 venv/
+
+# Herramientas de desarrollo
+.pytest_cache/
+.claude/

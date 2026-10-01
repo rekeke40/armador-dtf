@@ -10,32 +10,87 @@ import io
 import ipaddress
 import json
 import os
+import re
 import secrets
+import shutil
 import socket
+import subprocess
+import sys
 import time
 import uuid
 import webbrowser
 from collections import Counter, defaultdict
 from functools import wraps
 from pathlib import Path
-from threading import Timer
+from threading import Thread, Timer
 
 from flask import (Flask, jsonify, redirect, request, send_from_directory,
                    session, url_for)
-from werkzeug.utils import secure_filename
 
 from engine import packer, exporter
 
-APP_DIR = Path(__file__).parent
-UPLOAD_DIR = APP_DIR / "uploads"
+# ==========================================================================
+# Donde vive cada cosa
+#
+# Como programa suelto (.exe) el codigo corre desde una carpeta temporal de
+# SOLO LECTURA que arma PyInstaller (sys._MEIPASS): ahi viven la interfaz y
+# los perfiles. Lo que el programa guarda —PIN, cargas, tunel— va junto al
+# .exe, para que se lo pueda llevar en una USB con todo y su configuracion.
+# Si esa carpeta no deja escribir (USB protegida, "Archivos de programa"),
+# se usa la carpeta del usuario.
+# ==========================================================================
+
+ES_APP = getattr(sys, "frozen", False)
+RECURSOS = Path(getattr(sys, "_MEIPASS", str(Path(__file__).parent)))
+
+
+def _escribible(carpeta):
+    try:
+        carpeta.mkdir(parents=True, exist_ok=True)
+        prueba = carpeta / ".escritura"
+        prueba.write_text("ok", "utf-8")
+        prueba.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _carpeta_de_datos():
+    junto_al_programa = (Path(sys.executable).parent if ES_APP
+                         else Path(__file__).parent)
+    if _escribible(junto_al_programa):
+        return junto_al_programa
+    respaldo = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "ArmadorDTF"
+    respaldo.mkdir(parents=True, exist_ok=True)
+    return respaldo
+
+
+DATOS = _carpeta_de_datos()
+UPLOAD_DIR = DATOS / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
-for _old in UPLOAD_DIR.iterdir():  # limpiar cargas de sesiones anteriores
-    _old.unlink(missing_ok=True)
+
+
+def limpiar_cargas_viejas():
+    """Borra las cargas de sesiones anteriores.
+
+    Se llama desde main() DESPUES de comprobar que no hay otro Armador
+    abierto: si se hiciera al importar, un segundo doble clic borraba los
+    disenos que la primera ventana todavia estaba usando.
+    """
+    for viejo in UPLOAD_DIR.iterdir():
+        try:
+            viejo.unlink()
+        except OSError:
+            pass
+
+# el perfil CMYK propio del usuario se busca junto al programa antes que el
+# que venga empaquetado, para que pueda cambiarlo sin rearmar el .exe
+exporter.usar_carpeta_de_perfiles(DATOS, RECURSOS)
 
 PORT = int(os.environ.get("ARMADOR_PORT", 8765))
 HOST = os.environ.get("ARMADOR_HOST", "0.0.0.0")
 
-app = Flask(__name__, static_folder=str(APP_DIR / "static"), static_url_path="")
+app = Flask(__name__, static_folder=str(RECURSOS / "static"), static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 
 
@@ -50,7 +105,7 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 #      cloudflared se conecte desde 127.0.0.1.
 # ==========================================================================
 
-CONFIG_FILE = APP_DIR / "config.json"
+CONFIG_FILE = DATOS / "config.json"
 
 
 def load_config():
@@ -82,9 +137,17 @@ def client_is_local():
     """True solo si el navegador esta en esta misma PC.
 
     cloudflared se conecta desde 127.0.0.1, asi que la direccion de origen no
-    basta: si vienen cabeceras de proxy, la peticion llego desde fuera.
+    basta. Se piden tres cosas a la vez: que no vengan cabeceras de proxy, que
+    la peticion salga de la loopback y que el navegador haya pedido
+    "localhost" y no un dominio de fuera. Lo tercero es la red de seguridad:
+    una peticion del tunel siempre trae Host = algo.trycloudflare.com, asi que
+    aunque alguien lograra quitarle las cabeceras seguiria sin pasar por local
+    — y pasar por local es entrar sin PIN.
     """
     if request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For"):
+        return False
+    host = (request.host or "").rsplit(":", 1)[0].strip("[]").lower()
+    if host not in ("127.0.0.1", "localhost", "::1"):
         return False
     return request.remote_addr in ("127.0.0.1", "::1")
 
@@ -107,12 +170,29 @@ def login_blocked(key):
     return max(0, int(restante))
 
 
+# El PIN protege lo que entra por la red (celular, iPad, tunel). En la PC
+# donde corre el programa no tiene sentido: ya estas sentado frente a ella.
+# Con ARMADOR_PIN_SIEMPRE=1 se vuelve a pedir tambien aqui.
+PIN_TAMBIEN_LOCAL = str(os.environ.get("ARMADOR_PIN_SIEMPRE", "")).lower() in ("1", "si", "true")
+
+
+@app.get("/api/ping")
+def api_ping():
+    """Para saber si ya hay un Armador corriendo en este puerto."""
+    return jsonify({"armador": True, "puerto": PORT})
+
+
 @app.before_request
 def require_login():
     ruta = request.path
-    if ruta in ("/login", "/api/login", "/login.html", "/style.css") or ruta.startswith("/static/"):
+    if ruta in ("/login", "/api/login", "/login.html", "/style.css",
+                "/api/ping") or ruta.startswith("/static/"):
         return None
     if session.get("ok"):
+        return None
+    if client_is_local() and not PIN_TAMBIEN_LOCAL:
+        session.permanent = True
+        session["ok"] = True
         return None
     if ruta.startswith("/api/"):
         return jsonify({"error": "Sesión expirada", "login": True}), 401
@@ -199,11 +279,17 @@ def default_output_dir():
 
 OUTPUT_BASE = Path(os.environ.get("ARMADOR_SALIDA") or default_output_dir()).resolve()
 
-TUNNEL_FILE = APP_DIR / "tunnel_url.txt"
+TUNNEL_FILE = DATOS / "tunnel_url.txt"
 
 
 def read_tunnel_url():
-    """URL publica del tunel, que el lanzador escribe al arrancar cloudflared."""
+    """URL publica del tunel: la del proceso vivo, o la que dejo el lanzador."""
+    proc = TUNEL["proc"]
+    if proc is not None:
+        if proc.poll() is None:
+            return TUNEL["url"]
+        cerrar_tunel()          # se murio: no seguir anunciando su direccion
+        return None
     try:
         # utf-8-sig: PowerShell escribe el archivo con BOM y sin esto la URL
         # llegaria con un caracter invisible delante
@@ -231,6 +317,101 @@ def safe_output_dir(requested=None):
     return OUTPUT_BASE
 
 
+# --------------------------------------------------------------------------
+# Tunel a internet (opcional)
+#
+# Publica el programa en una direccion https de Cloudflare. Lo arranca el
+# usuario a proposito desde el boton de la interfaz, nunca solo: mientras el
+# tunel esta abierto, cualquiera con el enlace Y el PIN puede entrar.
+# --------------------------------------------------------------------------
+
+TUNEL = {"proc": None, "url": None}
+_SIN_VENTANA = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_PATRON_URL = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
+
+
+def buscar_cloudflared():
+    """cloudflared.exe junto al programa, en el PATH o donde lo deja su instalador."""
+    candidatos = [DATOS / "cloudflared.exe", RECURSOS / "cloudflared.exe",
+                  Path(r"C:\Program Files (x86)\cloudflared\cloudflared.exe"),
+                  Path(r"C:\Program Files\cloudflared\cloudflared.exe")]
+    for c in candidatos:
+        if c.is_file():
+            return str(c)
+    return shutil.which("cloudflared")
+
+
+def abrir_tunel():
+    """Arranca el tunel y devuelve (url, error)."""
+    if TUNEL["proc"] and TUNEL["proc"].poll() is None:
+        return TUNEL["url"], None
+    exe = buscar_cloudflared()
+    if not exe:
+        return None, ("Falta cloudflared.exe. Descárgalo de Cloudflare y "
+                      "déjalo en la carpeta del programa.")
+    log = DATOS / "tunnel.log"
+    try:
+        log.unlink(missing_ok=True)
+        salida = open(log, "wb")
+    except OSError as e:
+        return None, f"No se pudo escribir el registro del túnel: {e}"
+    try:
+        TUNEL["proc"] = subprocess.Popen(
+            [exe, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
+            stdout=salida, stderr=subprocess.STDOUT, creationflags=_SIN_VENTANA)
+    except OSError as e:
+        return None, f"No se pudo arrancar cloudflared: {e}"
+
+    for _ in range(50):                      # hasta ~30 s
+        time.sleep(0.6)
+        if TUNEL["proc"].poll() is not None:
+            break
+        try:
+            m = _PATRON_URL.search(log.read_bytes())
+        except OSError:
+            m = None
+        if m:
+            url = m.group().decode()
+            TUNEL["url"] = url
+            try:
+                TUNNEL_FILE.write_text(url, "utf-8")
+            except OSError:
+                pass
+            return url, None
+    cerrar_tunel()
+    return None, "Cloudflare no respondió. Revisa la conexión a internet."
+
+
+def cerrar_tunel():
+    proc = TUNEL["proc"]
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    TUNEL["proc"] = None
+    TUNEL["url"] = None
+    TUNNEL_FILE.unlink(missing_ok=True)
+
+
+@app.post("/api/tunel")
+def api_tunel():
+    """Abre o cierra el tunel. Solo desde la PC donde corre el programa."""
+    if not client_is_local():
+        return jsonify({"error": "Solo desde la PC del programa"}), 403
+    accion = (request.json or {}).get("accion")
+    if accion == "cerrar":
+        cerrar_tunel()
+        return jsonify({"ok": True, "url": None})
+    if accion == "abrir":
+        url, error = abrir_tunel()
+        if error:
+            return jsonify({"error": error}), 400
+        return jsonify({"ok": True, "url": url, "pin": PIN})
+    return jsonify({"error": "Acción desconocida"}), 400
+
+
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -248,6 +429,8 @@ def config():
         "lan_alternativas": [f"http://{ip}:{PORT}" for ip in ips[1:]],
         "is_server_pc": client_is_local(),
         "url_publica": read_tunnel_url(),
+        "tunel_disponible": bool(buscar_cloudflared()),
+        "pin": PIN if client_is_local() else None,
     })
 
 
@@ -269,11 +452,8 @@ def upload():
             results.append({"name": f.filename, "error": f"No se pudo abrir: {e}"})
             continue
         w_px, h_px = img.size
-        dpi_info = img.info.get("dpi") or (300, 300)
-        try:
-            dpi = float(dpi_info[0]) or 300
-        except (TypeError, ValueError):
-            dpi = 300
+        dpi = exporter.design_dpi(img)
+        borde_suave = exporter.porcentaje_borde_suave(img)
         thumb = img.copy()
         thumb.thumbnail((260, 260))
         buf = io.BytesIO()
@@ -284,6 +464,7 @@ def upload():
             "id": did, "name": f.filename, "w_px": w_px, "h_px": h_px,
             "native_w_cm": round(w_px / dpi * 2.54, 2),
             "native_h_cm": round(h_px / dpi * 2.54, 2),
+            "borde_suave": borde_suave,
             "thumb": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
         })
     return jsonify(results)
@@ -313,61 +494,111 @@ def _sheet_opts(payload):
         "alpha_threshold": int(num("alpha_threshold", 0, 0, 100)),
         "allow_rotate": bool(s.get("allow_rotate", True)),
         "mirror": bool(s.get("mirror", False)),
+        "con_blanco": bool(s.get("con_blanco", True)),
         "intent": s.get("intent", "perceptual"),
     }
 
 
-def _clean_fixed(payload, sheet_w, margin):
-    """Valida las piezas fijadas: descarta ids eliminados y las mantiene en la plancha."""
-    fixed = []
-    for f in payload.get("fixed") or []:
-        try:
-            if f.get("id") not in DESIGNS:
-                continue
-            w, h = float(f["w"]), float(f["h"])
-            x = min(max(float(f["x"]), margin), max(margin, sheet_w - margin - w))
-            y = max(float(f["y"]), margin)
-        except (TypeError, ValueError, KeyError):
-            continue
-        fixed.append({"key": f.get("key"), "uid": f.get("uid"), "id": f["id"],
-                      "x": x, "y": y, "w": w, "h": h,
-                      "rotated": bool(f.get("rotated"))})
-    return fixed
+# Topes de cordura: un cero de mas en la cantidad o en la medida colgaba el
+# servidor intentando acomodar millones de piezas o una plancha de kilometros.
+MAX_COPIAS = 2000
+MAX_LADO_CM = 500
 
 
-def _run_layout(payload):
-    s = _sheet_opts(payload)
-    fixed = _clean_fixed(payload, s["width_cm"], s["margin_cm"])
-    lock_counts = Counter(f["uid"] for f in fixed)
-
-    items = []
+def _items_validos(payload):
+    """Filas de la tabla que se pueden acomodar, por uid."""
+    items = {}
     for r in payload.get("items") or []:
         if r.get("id") not in DESIGNS:
             continue
         try:
-            qty = int(r.get("qty", 0)) - lock_counts.get(r.get("uid"), 0)
+            qty = int(r.get("qty", 0))
             w_cm, h_cm = float(r["w_cm"]), float(r["h_cm"])
         except (TypeError, ValueError, KeyError):
             continue
-        if qty > 0 and w_cm > 0 and h_cm > 0:
-            items.append({"uid": r.get("uid"), "id": r["id"],
-                          "w": w_cm, "h": h_cm, "qty": qty})
+        qty = min(qty, MAX_COPIAS)
+        if qty > 0 and 0 < w_cm <= MAX_LADO_CM and 0 < h_cm <= MAX_LADO_CM:
+            items[r.get("uid")] = {"uid": r.get("uid"), "id": r["id"],
+                                   "w": w_cm, "h": h_cm, "qty": qty}
+    return items
+
+
+def _clean_fixed(payload, items, s):
+    """Valida las piezas fijadas. Devuelve (fijadas, cuantas_se_liberaron).
+
+    Una pieza fijada que ya no es valida NO se tira: se devuelve al monton
+    automatico, para que la plancha lleve SIEMPRE la cantidad que pidio el
+    usuario. Antes, una fijada de mas (o encimada tras cambiar el ancho de la
+    plancha) se imprimia igual, y salian piezas de mas o dos encimadas.
+    """
+    sheet_w, margin = s["width_cm"], s["margin_cm"]
+    usable = sheet_w - 2 * margin
+    holgura = s["spacing_cm"] * 0.5      # la misma que usa la interfaz al soltar
+    fixed, liberadas = [], 0
+    puestas = Counter()
+
+    for f in payload.get("fixed") or []:
+        fila = items.get(f.get("uid"))
+        try:
+            w, h = float(f["w"]), float(f["h"])
+            x, y = float(f["x"]), float(f["y"])
+        except (TypeError, ValueError, KeyError):
+            liberadas += 1
+            continue
+        # la fila existe, no cambio de tamano y todavia le faltan copias
+        if (fila is None or f.get("id") != fila["id"]
+                or puestas[fila["uid"]] >= fila["qty"]
+                or not _mismo_tamano(w, h, fila, bool(f.get("rotated")))
+                or w > usable + 1e-9):
+            liberadas += 1
+            continue
+        x = min(max(x, margin), max(margin, sheet_w - margin - w))
+        y = max(y, margin)
+        pieza = {"key": f.get("key"), "uid": fila["uid"], "id": fila["id"],
+                 "x": x, "y": y, "w": w, "h": h,
+                 "rotated": bool(f.get("rotated"))}
+        if any(packer.overlaps(pieza, otra, holgura) for otra in fixed):
+            liberadas += 1
+            continue
+        fixed.append(pieza)
+        puestas[fila["uid"]] += 1
+    return fixed, liberadas
+
+
+def _mismo_tamano(w, h, fila, rotada):
+    """True si la pieza fijada conserva el tamano que dice su fila."""
+    esperado = (fila["h"], fila["w"]) if rotada else (fila["w"], fila["h"])
+    return abs(w - esperado[0]) < 0.02 and abs(h - esperado[1]) < 0.02
+
+
+def _run_layout(payload):
+    s = _sheet_opts(payload)
+    items = _items_validos(payload)
+    fixed, liberadas = _clean_fixed(payload, items, s)
+    fijadas = Counter(f["uid"] for f in fixed)
+
+    autos = []
+    for uid, it in items.items():
+        faltan = it["qty"] - fijadas.get(uid, 0)
+        if faltan > 0:
+            autos.append({**it, "qty": faltan})
 
     placements, length, too_big = packer.pack(
-        items, sheet_w=s["width_cm"], spacing=s["spacing_cm"],
+        autos, sheet_w=s["width_cm"], spacing=s["spacing_cm"],
         margin=s["margin_cm"], allow_rotate=s["allow_rotate"], fixed=fixed)
 
     all_p = ([{**f, "locked": True} for f in fixed] +
              [{**p, "locked": False} for p in placements])
-    return all_p, length, too_big, s
+    pedidas = sum(it["qty"] for it in items.values())
+    return all_p, length, too_big, s, {"pedidas": pedidas, "liberadas": liberadas}
 
 
 @app.post("/api/layout")
 def layout():
     try:
-        placements, length, too_big, _ = _run_layout(request.json or {})
+        placements, length, too_big, _, cuentas = _run_layout(request.json or {})
         return jsonify({"placements": placements, "length_cm": round(length, 2),
-                        "too_big": too_big})
+                        "too_big": too_big, **cuentas})
     except Exception as e:
         return jsonify({"error": f"No se pudo calcular el acomodo: {e}"}), 500
 
@@ -377,9 +608,9 @@ def preview_white():
     """Mascaras rojas translucidas con la cobertura real del canal White."""
     try:
         payload = request.json or {}
-        dpi = int(payload.get("dpi", 300))
-        choke = int(payload.get("choke_px", 0))
-        thr = int(payload.get("alpha_threshold", 0))
+        dpi = min(max(int(payload.get("dpi", 300)), 72), 1200)
+        choke = min(max(int(payload.get("choke_px", 0)), 0), 20)
+        thr = min(max(int(payload.get("alpha_threshold", 0)), 0), 100)
         masks = {}
         for it in payload.get("items") or []:
             did = it.get("id")
@@ -405,11 +636,29 @@ def preview_white():
         return jsonify({"error": f"No se pudo generar la vista del canal White: {e}"}), 500
 
 
+def _escribir_archivo(destino, escritor):
+    """Escribe con nombre temporal y renombra al final.
+
+    Si algo se rompe a media escritura (un codec que falta, disco lleno, la
+    memoria), sin esto quedaba un .tif de 8 bytes con nombre de plancha
+    buena — y eso el RIP lo abre como si nada. Medido con una exportacion
+    fallida: dos archivos corruptos indistinguibles de los correctos.
+    """
+    temporal = destino.with_name(destino.name + ".parcial")
+    try:
+        escritor(str(temporal))
+        temporal.replace(destino)
+    except BaseException:
+        temporal.unlink(missing_ok=True)
+        raise
+    return destino
+
+
 @app.post("/api/export")
 def export():
     try:
         payload = request.json or {}
-        placements, length, too_big, s = _run_layout(payload)
+        placements, length, too_big, s, cuentas = _run_layout(payload)
         # por si un diseño fue eliminado entre el acomodo y la exportacion
         skipped = len([p for p in placements if p["id"] not in DESIGNS])
         placements = [p for p in placements if p["id"] in DESIGNS]
@@ -434,30 +683,13 @@ def export():
                                          alpha_threshold=s["alpha_threshold"])
 
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        mode = payload.get("format", "rgb_tiff")
         files = []
-        if mode == "rgb_tiff":
-            out = out_dir / f"plancha_{stamp}.tif"
-            exporter.export_rgb_tiff(sheet, str(out), dpi)
-            files.append(out)
-        elif mode == "png":
-            out = out_dir / f"plancha_{stamp}.png"
-            exporter.export_png(sheet, str(out), dpi)
-            files.append(out)
-        elif mode == "cmyk_spot":
-            out = out_dir / f"plancha_{stamp}_CMYK.tif"
-            exporter.export_tiff(sheet, str(out), dpi,
-                                 choke_px=s["choke_px"], intent=s["intent"])
-            files.append(out)
-        elif mode == "cmyk_dos":
-            color = out_dir / f"plancha_{stamp}_COLOR.tif"
-            white = out_dir / f"plancha_{stamp}_BLANCO.tif"
-            exporter.export_tiff(sheet, str(color), dpi,
-                                 choke_px=s["choke_px"], intent=s["intent"])
-            exporter.export_white_tiff(sheet, str(white), dpi, choke_px=s["choke_px"])
-            files += [color, white]
-        else:
-            return jsonify({"error": f"Formato desconocido: {mode}"}), 400
+        sufijo = "CMYK+W" if s["con_blanco"] else "CMYK"
+        out = out_dir / f"plancha_{stamp}_{sufijo}.tif"
+        _escribir_archivo(out, lambda r: exporter.export_tiff(
+            sheet, r, dpi, choke_px=s["choke_px"], intent=s["intent"],
+            con_blanco=s["con_blanco"]))
+        files.append(out)
 
         return jsonify({
             "files": [{"path": str(f), "name": f.name,
@@ -466,7 +698,7 @@ def export():
             "length_cm": round(length, 2),
             "size_px": [sheet.width, sheet.height],
             "mirror": s["mirror"],
-            "too_big": too_big, "skipped": skipped,
+            "too_big": too_big, "skipped": skipped, **cuentas,
         })
     except Exception as e:
         return jsonify({"error": f"No se pudo exportar la plancha: {e}"}), 500
@@ -476,8 +708,12 @@ def export():
 def descargar():
     """Descarga un archivo ya exportado (util desde el celular o el iPad)."""
     folder = safe_output_dir(request.args.get("dir"))
-    name = secure_filename(request.args.get("name") or "")
-    if not name or not (folder / name).is_file():
+    # Nombre tal cual, sin rutas. secure_filename() no sirve aqui: le quita el
+    # "+" a "..._CMYK+W.tif" y la descarga del modo predeterminado daba 404.
+    pedido = request.args.get("name") or ""
+    name = os.path.basename(pedido)
+    if (not name or name != pedido or name in (".", "..") or ":" in name
+            or not (folder / name).is_file()):
         return jsonify({"error": "Archivo no encontrado"}), 404
     return send_from_directory(str(folder), name, as_attachment=True)
 
@@ -506,21 +742,162 @@ def quitar():
     return jsonify({"ok": True})
 
 
-if __name__ == "__main__":
-    # el lanzador con tunel lo reescribe despues; asi nunca se muestra una
-    # direccion publica vieja que ya no responde
-    TUNNEL_FILE.unlink(missing_ok=True)
-    url_local = f"http://127.0.0.1:{PORT}"
-    ips = lan_ips()
+# --------------------------------------------------------------------------
+# Arranque
+# --------------------------------------------------------------------------
+
+def puerto_libre(preferido):
+    """El puerto preferido, o el primero libre despues de el."""
+    for p in range(preferido, preferido + 20):
+        with socket.socket() as s:
+            try:
+                s.bind(("0.0.0.0", p))
+                return p
+            except OSError:
+                continue
+    return preferido
+
+
+def instancia_viva(puerto):
+    """True si en ese puerto ya responde OTRO Armador (doble clic al icono)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{puerto}/api/ping",
+                                    timeout=1.5) as r:
+            return json.loads(r.read()).get("armador") is True
+    except Exception:
+        return False
+
+
+def servir():
+    """Servidor de verdad (waitress) y, si no estuviera, el de Flask."""
+    try:
+        from waitress import serve
+    except ImportError:
+        app.run(host=HOST, port=PORT, debug=False, threaded=True)
+        return
+    # clear_untrusted_proxy_headers=False: el programa necesita ver
+    # X-Forwarded-For para distinguir lo que entra por el tunel de lo que
+    # entra desde esta misma PC.
+    serve(app, host=HOST, port=PORT, threads=8, ident="Armador DTF",
+          channel_timeout=900, clear_untrusted_proxy_headers=False)
+
+
+def esperar_servidor(puerto, segundos=20):
+    for _ in range(int(segundos * 5)):
+        if instancia_viva(puerto):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def abrir_ventana(url):
+    """Ventana propia (WebView2). False si este equipo no puede con ella."""
+    try:
+        import webview
+    except Exception as e:
+        print(f"Sin motor de ventana ({e}); se usa el navegador.")
+        return False
+
+    def asegurar_carga(ventana):
+        """WebView2 a veces se come la primera navegacion mientras arranca.
+
+        Medido: la ventana abria en blanco y solo con F5 aparecia el programa.
+        Aqui se comprueba que la pagina este cargada de verdad y, si no, se
+        vuelve a pedir — sin parpadeo cuando cargo bien a la primera.
+        """
+        for _ in range(15):
+            time.sleep(0.4)
+            try:
+                if ventana.evaluate_js("document.title") == "Armador DTF":
+                    return
+                ventana.load_url(url)
+            except Exception:
+                return
+
+    try:
+        ventana = webview.create_window("Armador DTF", url, width=1360,
+                                        height=860, min_size=(900, 560),
+                                        text_select=True)
+        webview.start(asegurar_carga, ventana)   # bloquea hasta que la cierran
+        return True
+    except Exception as e:
+        print(f"No se pudo abrir la ventana ({e}); se usa el navegador.")
+        return False
+
+
+def ventana_de_respaldo(url):
+    """Sin WebView2: navegador y una ventanita para poder apagar el programa."""
+    webbrowser.open(url)
+    try:
+        import tkinter as tk
+        raiz = tk.Tk()
+        raiz.title("Armador DTF")
+        raiz.geometry("430x170")
+        raiz.configure(bg="#14161b")
+        tk.Label(raiz, text="Armador DTF está corriendo", bg="#14161b",
+                 fg="#f5d03b", font=("Segoe UI", 13, "bold")).pack(pady=(24, 6))
+        tk.Label(raiz, text=f"Abierto en el navegador:\n{url}", bg="#14161b",
+                 fg="#e8eaf0", font=("Segoe UI", 9)).pack()
+        tk.Button(raiz, text="Apagar el programa", command=raiz.destroy,
+                  font=("Segoe UI", 9)).pack(pady=14)
+        raiz.mainloop()
+    except Exception:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None, f"Armador DTF está corriendo en {url}\n\n"
+                  "Deja esta ventana abierta mientras lo usas.",
+            "Armador DTF", 0x40)
+
+
+def banner(url_local, ips):
     print("\n" + "=" * 58)
     print("  ARMADOR DTF esta corriendo")
     print("=" * 58)
-    print(f"  PIN de acceso ...... {PIN}")
-    print(f"  En esta PC ......... {url_local}")
-    print(f"  Celular / iPad ..... http://{ips[0]}:{PORT}")
+    print(f"  PIN (celular / iPad)  {PIN}")
+    print(f"  En esta PC .......... {url_local}")
+    print(f"  Celular / iPad ...... http://{ips[0]}:{PORT}")
     for extra in ips[1:]:
         print(f"     (si no abre, prueba  http://{extra}:{PORT})")
     print("  La misma red WiFi. Cierra esta ventana para apagarlo.")
     print("=" * 58 + "\n")
-    Timer(1.2, lambda: webbrowser.open(url_local)).start()
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+
+
+def main():
+    global PORT
+    modo_ventana = ES_APP or "--ventana" in sys.argv
+    if "--navegador" in sys.argv:
+        modo_ventana = False
+
+    # si ya hay un Armador abierto, no levantar otro: se enseña el que existe
+    if instancia_viva(PORT):
+        url = f"http://127.0.0.1:{PORT}"
+        if modo_ventana and abrir_ventana(url):
+            return
+        webbrowser.open(url)
+        return
+
+    limpiar_cargas_viejas()
+    TUNNEL_FILE.unlink(missing_ok=True)   # nunca mostrar una direccion vieja
+    PORT = puerto_libre(PORT)
+    url_local = f"http://127.0.0.1:{PORT}"
+    Thread(target=servir, daemon=True).start()
+    esperar_servidor(PORT)
+
+    try:
+        if modo_ventana:
+            if not abrir_ventana(url_local):
+                ventana_de_respaldo(url_local)
+        else:
+            banner(url_local, lan_ips())
+            Timer(1.2, lambda: webbrowser.open(url_local)).start()
+            while True:                    # el servidor vive en su hilo
+                time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cerrar_tunel()
+
+
+if __name__ == "__main__":
+    main()

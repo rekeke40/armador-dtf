@@ -1,10 +1,22 @@
-Para que los colores salgan igual que en tu flujo de Photoshop:
+PERFIL CMYK DEL ARMADOR DTF
 
-1. En la PC que tiene Photoshop, busca el perfil CMYK que usas
-   (Edicion > Ajustes de color, o en C:\Windows\System32\spool\drivers\color\
-   o C:\Program Files\Common Files\Adobe\Color\Profiles\).
-2. Copia ese archivo .icc o .icm a esta carpeta con el nombre:  cmyk.icc
-3. Reinicia el Armador DTF.
+El programa convierte los disenos a CMYK con el perfil que encuentre aqui,
+con el nombre exacto:  cmyk.icc
 
-Si no pones ningun perfil, el programa usa el perfil SWOP que trae Windows
-(RSWOP.icm), que da buenos resultados generales.
+El que se usa en produccion es Japan Web Coated (Ad), con intento Perceptual
+y compensacion de punto negro: es la misma conversion que hace Photoshop con
+"Edicion > Convertir en perfil", asi que el color sale igual que en ese flujo.
+El .exe ya lo trae incluido.
+
+Para usar otro perfil (por ejemplo, uno hecho para tu impresora, tinta y
+pelicula):
+  1. Copia el .icc o .icm a una carpeta "perfiles" junto a "Armador DTF.exe"
+     (o a esta carpeta, si lo corres desde el codigo).
+  2. Ponle de nombre:  cmyk.icc
+  3. Reinicia el Armador DTF.
+
+Si no hay ningun cmyk.icc, se usa el perfil SWOP que trae Windows (RSWOP.icm).
+Sirve para probar, pero no es un perfil pensado para DTF.
+
+Los perfiles .icc no se suben al repositorio: suelen tener licencia del
+fabricante (Adobe, en el caso de Japan Web Coated).

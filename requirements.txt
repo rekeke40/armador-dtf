@@ -3,3 +3,11 @@ Pillow>=10.0
 numpy>=1.26
 tifffile>=2024.1
 imagecodecs>=2024.1
+
+# Ventana de aplicacion y servidor de verdad (el .exe los usa; sin ellos el
+# programa sigue funcionando en el navegador con el servidor de Flask)
+pywebview>=5.0
+waitress>=3.0
+
+# Solo para armar el .exe:  python empaque/construir.py
+# pyinstaller>=6.0

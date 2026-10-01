@@ -1,132 +1,136 @@
 # Armador DTF
 
-Arma planchas de producción DTF automáticamente: acomoda los diseños en el rollo,
-calcula el largo y exporta el archivo listo para el RIP. Reemplaza el armado
-manual en iCore.
+**Armado automático de planchas de producción para impresión DTF (Direct to Film).**
+Acomoda los diseños de un pedido en el ancho del rollo, calcula el largo de
+película y entrega un TIFF CMYK + White listo para el RIP. Sustituye el armado
+manual en Photoshop o iCore.
 
-Funciona en la PC, y desde el celular o el iPad conectados a la misma WiFi.
+![Pruebas](https://github.com/rokeke40/armador-dtf/actions/workflows/pruebas.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)
+![RIP](https://img.shields.io/badge/RIP-MainTop%206.1-555)
+
+![Armador DTF: plancha de 33 piezas en un rollo de 57 cm](docs/img/armador-plancha.png)
 
 ---
 
-## Cómo se usa
+## El problema
 
-1. Doble clic en el acceso directo **Armador DTF** del escritorio.
-   Se abre solo en el navegador.
-2. Arrastra tus PNG (con transparencia) a la zona de carga. También acepta TIFF y JPG.
-3. A cada diseño ponle su **ancho o alto en cm** (el otro lado se calcula solo) y la
-   **cantidad** de repeticiones.
-4. La plancha se acomoda sola y ves la vista previa con el largo total.
-5. **Exportar plancha** → el archivo queda en `Escritorio\Planchas DTF`.
+En un taller DTF, cada pedido pasa por un paso intermedio que no agrega valor:
+**armar la plancha**. Alguien abre los archivos del cliente, los escala a la
+medida pedida, los duplica tantas veces como prendas haya y los acomoda a mano
+sobre un lienzo del ancho del rollo. Después convierte a CMYK, genera el canal
+de tinta blanca y exporta para el RIP.
 
-### Hay dos formas de arrancarlo
+Ese trabajo manual cuesta en tres frentes:
 
-| Acceso directo | Qué hace |
+| Frente | Qué se pierde |
 |---|---|
-| **Armador DTF** | Solo en esta PC y en la WiFi del taller. |
-| **Armador DTF (con internet)** | Además abre un túnel de Cloudflare y te da una dirección `https://` que funciona desde cualquier parte. |
+| **Tiempo de operador** | Minutos por pedido en una tarea repetitiva, multiplicados por cada pedido del día. |
+| **Película y tinta** | Un acomodo hecho a ojo deja huecos. Cada centímetro de largo es película, tinta blanca y polvo adhesivo. |
+| **Errores de producción** | Una pieza de menos, una de más, una medida mal escalada o una base blanca que asoma por el borde: se descubren después de imprimir, prensar y gastar. |
 
-En ambos casos el programa pide un **PIN** antes de dejar entrar. El PIN se
-genera solo la primera vez y se guarda en `config.json`; aparece en la ventana
-negra al arrancar. Para cambiarlo, edita ese archivo o pon la variable de
-entorno `ARMADOR_PIN`. La sesión dura 30 días por dispositivo, así que el PIN se
-escribe una sola vez en cada celular.
+## La solución
 
-### Desde el celular o el iPad
+Armador DTF convierte ese paso en una tarea de captura de datos: **qué diseño,
+a qué medida, cuántas veces**. El resto lo calcula el programa.
 
-Toca el botón **📱** en la barra de arriba: muestra las direcciones disponibles,
-la pública (si el túnel está activo) y la de la WiFi.
+1. Se arrastran los archivos del cliente (PNG, TIFF de Photoshop, JPG).
+2. Se escribe el ancho o el alto en centímetros y la cantidad de cada uno, en una
+   tabla que se recorre con el teclado como una hoja de cálculo.
+3. La plancha se acomoda sola, con la vista previa y el largo exacto.
+4. **Exportar plancha** genera el TIFF que abre el RIP, con el tamaño físico y
+   la resolución correctos.
 
-La plancha siempre se genera y se guarda **en la PC**, que es donde está el RIP.
-Desde el celular puedes armar, revisar, exportar y descargar el archivo.
+El operador puede intervenir: arrastrar una pieza para fijarla, girarla o
+liberarla, y el acomodo automático rellena alrededor sin perder película.
 
-> La dirección `https://…trycloudflare.com` **cambia cada vez que reinicias el
-> programa**. Para una dirección fija hace falta un dominio propio en Cloudflare
-> (unos 10 USD al año).
+## Resultados medidos
 
-### Qué protege el programa cuando está publicado
+Cada cifra sale de pruebas sobre el programa, no de estimaciones
+(detalle en [docs/FLUJO-DE-COLOR.md](docs/FLUJO-DE-COLOR.md)).
 
-- Todo exige el PIN; tras 5 intentos fallidos hay bloqueo temporal creciente.
-- Solo se leen y escriben archivos dentro de `Escritorio\Planchas DTF`. Cualquier
-  otra ruta enviada por el navegador se ignora.
-- "Abrir carpeta" solo funciona desde el navegador de la propia PC; por internet
-  se rechaza.
-- El túnel nunca cuenta como "PC local", aunque cloudflared se conecte desde
-  `127.0.0.1`.
-
-**`config.json` contiene tu PIN y la llave de sesión: no lo subas a GitHub.**
-Ya está en `.gitignore`.
-
-## Hoja de diseños
-
-Cada fila es un uso de un diseño: miniatura, nombre, ancho, alto y cantidad.
-
-- **Enter** baja a la misma columna de la siguiente fila (como hoja de cálculo).
-- **⧉ Duplicar** crea otra fila con el mismo archivo (el mismo diseño en dos tamaños).
-- Abajo se ve el total de piezas, los m² de arte y el largo de plancha.
-
-## Armado semi-automático
-
-El acomodo es automático, pero puedes intervenir:
-
-- **Arrastra** una pieza en la vista previa para fijarla 📌 donde quieras; el
-  acomodo automático la respeta y acomoda el resto alrededor.
-- **Toca** una pieza para seleccionarla; **⟳** (o la tecla **R**) la gira 90° y la fija.
-- **🔓** libera la pieza seleccionada; **🔓 Liberar todo** vuelve al modo automático.
-- Si una posición pisa otra pieza fijada, el programa la rechaza y avisa.
-- Cambiar el *tamaño* de una fila libera sus piezas fijadas (la posición ya no
-  sería válida); cambiar la *cantidad* las conserva.
-- La exportación respeta exactamente lo que ves en pantalla.
-
-## Ajustes
-
-| Ajuste | Qué hace | Valor típico |
-|---|---|---|
-| Ancho útil | Ancho imprimible del rollo | 57 cm (rollo de 60) |
-| Separación | Espacio entre diseños | 0.5 cm |
-| Margen | Borde libre alrededor de la plancha | 0.5 cm |
-| DPI | Resolución del archivo final | 300 |
-| Limpiar bordes | Borra los píxeles por debajo de ese % de opacidad | 0, o 15–20 % |
-| Girar 90° | Permite rotar diseños para aprovechar espacio | activado |
-| Espejo | Espejea la película | **apagado** (ver abajo) |
-
-**Espejo:** en DTF la película se imprime al revés porque el diseño se transfiere.
-Casi todos los RIP lo hacen ellos mismos. Si MainTop ya espejea y además lo
-activas aquí, el diseño sale al derecho y se arruina. Actívalo solo si
-compruebas que MainTop *no* lo está haciendo.
-
-**Limpiar bordes:** los píxeles casi transparentes reciben muy poca tinta,
-retienen poco polvo adhesivo y terminan despegándose. Este ajuste los elimina.
-
-## Formatos de salida
-
-| Modo | Cuándo usarlo |
+| Indicador | Resultado |
 |---|---|
-| **TIFF RGB + alpha** | Predeterminado. Máximo color: el RIP hace la conversión con su perfil. |
-| **PNG RGB + alpha** | Igual pero más liviano. |
-| **TIFF CMYK + White** | Compatibilidad con el flujo viejo de Photoshop (canal de tinta plana). |
-| **TIFF color + blanco** | Dos archivos separados, para RIP que quieren el blanco aparte. |
+| Película al fijar una pieza a mano | **−28 %** respecto del algoritmo anterior (97.3 → 69.7 cm). Fijar ya no cuesta película. |
+| Pedido mixto de 32 piezas | 163 → **153 cm** de rollo |
+| Acomodo de 800 piezas | **12 ms** |
+| Color frente a Photoshop | Valores CMYK **idénticos** en 9 colores sólidos de prueba (Japan Web Coated, Perceptual + BPC) |
+| Memoria al exportar 1 m de plancha | 5.35 GB → **1.26 GB** (3 m: 15.2 → 2.7 GB) |
+| Cantidad de piezas | Garantizada por el servidor: ni una de más ni una de menos, aunque haya piezas fijadas inválidas |
+| Compatibilidad con el RIP | Verificada en **MainTop DTP 6.1**: tamaño físico y 300 dpi exactos al importar |
 
-Por qué el predeterminado cambió de CMYK a RGB está explicado con mediciones en
-**[ANALISIS-COLOR.md](ANALISIS-COLOR.md)**. Resumen: convertir a CMYK SWOP antes
-de mandar al RIP destruía los azules, verdes y naranjas saturados (ΔE de hasta
-52), y esa pérdida ya no se recupera dentro de MainTop.
+## Capacidades
 
-> **Antes de tirar producción:** exporta una plancha chica de prueba y confirma
-> que MainTop la lee bien. El plan de prueba está al final de ANALISIS-COLOR.md.
+**Producción**
+- Acomodo automático *bottom-left fill* con rotación de 90° y piezas fijadas como obstáculos.
+- Armado semiautomático: arrastrar para fijar 📌, girar con **R**, liberar una o todas.
+- Totales en vivo: piezas, m² de arte y largo de plancha.
+- Aviso de **bordes casi transparentes** (sombras difuminadas que en DTF no retienen polvo y se despegan), con corrección de un clic.
 
-## Canal White
+**Salida para el RIP**
+- TIFF **CMYK + White** de 5 canales, con el blanco declarado como tinta plana (InkSet, InkNames y recursos de Photoshop), o CMYK de 4 canales.
+- Conversión **sRGB → Japan Web Coated**, Perceptual + compensación de punto negro, igual a Photoshop. Perfil intercambiable.
+- **Contracción del blanco** (*choke*) que no borra la base de los trazos finos.
+- Compresión PACKBITS: MainTop 6.1 rechaza el LZW de imagecodecs y el deflate.
+- Vista previa del **canal White** sobre la plancha.
+- Espejo y limpieza de bordes opcionales.
 
-El botón **👁 Canal White** pinta en rojo dónde llevará tinta blanca la plancha,
-como Photoshop muestra un canal de tinta plana. Se calcula desde el alpha real de
-cada diseño. Es una ayuda visual; el blanco lo genera el RIP.
+**Lectura de archivos del cliente**
+- TIFF de Photoshop con el **canal extra de base blanca**, CMYK, 16 bits, LZW, mosaicos y BigTIFF: el recorte del arte se conserva.
+- Perfiles ICC incrustados, alpha premultiplicado y resoluciones mal declaradas (un TIFF "a 1 dpi" no se convierte en una pieza de 15 metros).
 
-## Perfil de color CMYK
+**Operación en el taller**
+- Aplicación de escritorio **portable** para Windows: no se instala, no necesita Python.
+- Uso desde **celular o iPad** en la misma red, protegido con PIN.
+- Publicación opcional en internet con un túnel de Cloudflare.
 
-Solo importa si usas un modo CMYK. Copia el perfil de tu impresora a
-`perfiles/cmyk.icc` (instrucciones en `perfiles/LEEME.txt`). Sin eso se usa el
-perfil SWOP de Windows, que **no** es adecuado para DTF.
+| Canal White | Celular |
+|---|---|
+| ![Vista del canal White](docs/img/armador-canal-white.png) | ![Armador DTF en el celular](docs/img/armador-celular-plancha.png) |
 
-## Instalación
+## Arquitectura
+
+```mermaid
+flowchart LR
+    subgraph Cliente["Interfaz (HTML + JS, sin frameworks)"]
+        UI[Tabla de diseños<br/>Vista previa<br/>Arrastre de piezas]
+    end
+    subgraph Servidor["app.py · Flask + waitress"]
+        API[API REST]
+        SEG[PIN · sesión<br/>detección de acceso local]
+    end
+    subgraph Motor["engine/"]
+        PK[packer.py<br/>acomodo bottom-left]
+        EX[exporter.py<br/>lectura · composición · CMYK]
+    end
+    UI <-->|JSON| API
+    API --> SEG
+    API --> PK
+    API --> EX
+    EX -->|TIFF CMYK + White| RIP[(MainTop / RIP)]
+    VENTANA[pywebview · WebView2] -.-> UI
+    CEL[Celular / iPad] -.->|LAN o túnel, con PIN| API
+```
+
+- **`engine/packer.py`**: acomodo puro, sin dependencias de imagen. Determinista: lo que se ve en pantalla es lo que se exporta.
+- **`engine/exporter.py`**: lectura robusta de archivos de imprenta, composición a resolución final y conversión CMYK por franjas.
+- **`app.py`**: servidor local, validación de pedidos, seguridad y ventana de escritorio.
+- **`static/`**: interfaz web adaptable a escritorio y móvil.
+- **`empaque/`**: construcción del ejecutable portable con PyInstaller.
+
+Detalle de cada módulo, la API y el formato del TIFF en
+[docs/ARQUITECTURA.md](docs/ARQUITECTURA.md).
+
+## Inicio rápido
+
+### Usarlo en el taller
+
+Descargar el ZIP de la versión, extraerlo y abrir `Armador DTF.exe`. Windows 10 u
+11 de 64 bits. Las planchas quedan en `Escritorio\Planchas DTF`.
+Guía completa en el [manual de uso](docs/MANUAL.md).
+
+### Desde el código
 
 Requiere Python 3.10 o superior.
 
@@ -135,8 +139,72 @@ pip install -r requirements.txt
 python app.py
 ```
 
-En Windows basta con el `.bat` incluido. El programa escucha en el puerto 8765;
-se puede cambiar con la variable de entorno `ARMADOR_PORT`.
+Abre la interfaz en el navegador. `python app.py --ventana` la abre como
+aplicación de escritorio.
 
-Para que solo sea accesible desde la propia PC (sin celular ni iPad):
-`ARMADOR_HOST=127.0.0.1`.
+Para igualar el color de Photoshop, copiar el perfil CMYK del taller a
+`perfiles/cmyk.icc` (ver [perfiles/LEEME.txt](perfiles/LEEME.txt)). Los perfiles
+no se incluyen en el repositorio por su licencia.
+
+### Construir el ejecutable
+
+```bash
+pip install pyinstaller
+python empaque/construir.py carpeta
+```
+
+Deja la versión portable en `dist/Armador DTF/`.
+
+## Calidad
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+43 pruebas automáticas cubren los tres módulos y corren en cada *push* con GitHub Actions:
+
+- **Acomodo**: sin solapes, separación respetada, piezas fijadas, rotación, determinismo, aprovechamiento y rendimiento.
+- **Exportación**: estructura del TIFF que espera MainTop, compresión, canal White, choke en trazos finos y equivalencia exacta entre la conversión por franjas y la de la plancha completa.
+- **Servidor**: PIN, bloqueo por fuerza bruta, acceso por túnel o proxy, rutas fuera de la carpeta de salida, carga de archivos dañados, cantidades absurdas y exportación de punta a punta.
+
+Además, [`tests/e2e/prueba_e2e.py`](tests/e2e/prueba_e2e.py) valida **el ejecutable
+tal como se entrega**: se abre el `.exe` recién descomprimido y el script lo
+recorre por HTTP como lo haría la interfaz.
+
+## Documentación
+
+| Documento | Contenido |
+|---|---|
+| [Manual de uso](docs/MANUAL.md) | Operación diaria, ajustes, armado semiautomático, uso desde el celular |
+| [Arquitectura](docs/ARQUITECTURA.md) | Módulos, API, algoritmo de acomodo, formato del TIFF, empaquetado |
+| [Flujo de color](docs/FLUJO-DE-COLOR.md) | Bitácora técnica de las decisiones de color, con mediciones |
+| [Seguridad](docs/SEGURIDAD.md) | Modelo de amenazas del acceso por red e internet |
+| [Cambios](CHANGELOG.md) | Historial de versiones |
+
+## Estructura del repositorio
+
+```
+├── app.py                  servidor, API y ventana de escritorio
+├── engine/
+│   ├── packer.py           acomodo de piezas en el rollo
+│   └── exporter.py         lectura de diseños y exportación TIFF
+├── static/                 interfaz web (escritorio y móvil)
+├── perfiles/               perfil CMYK del taller (no versionado)
+├── empaque/                construcción del .exe portable
+├── tests/                  pruebas automáticas y de punta a punta
+└── docs/                   manual, arquitectura, color y seguridad
+```
+
+## Hoja de ruta
+
+- Confirmar en la impresora DTF de producción el consumo real de tinta blanca por canal.
+- Plantillas de pedido reutilizables (diseño + medida + cantidad).
+- Estimación de costo por plancha: película, tinta y polvo por metro.
+- Exportación por lotes cuando el pedido supera el largo máximo de un rollo.
+- Firma digital del ejecutable para evitar el aviso de SmartScreen.
+
+---
+
+Desarrollado para la operación diaria de un taller de impresión DTF que trabaja
+con rollo de 60 cm, MainTop 6.1 y 300 dpi.

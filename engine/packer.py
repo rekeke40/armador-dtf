@@ -1,29 +1,69 @@
-"""Acomodo automatico de diseños en la plancha (algoritmo de estantes/shelf).
+"""Acomodo automatico de disenos en la plancha (abajo-izquierda con obstaculos).
 
 Todas las medidas se manejan en centimetros. El origen (0,0) es la esquina
 superior izquierda de la plancha; la plancha crece hacia abajo (largo del rollo).
 
-Soporta "piezas fijadas" (fixed): rectangulos ya colocados por el usuario que
-el algoritmo trata como obstrucciones — el cursor de cada estante las salta
-horizontalmente, y los estantes nuevos se prueban en TODOS los huecos libres
-de arriba hacia abajo, no solo debajo del ultimo estante.
+Por que no estantes ("shelf"): el algoritmo de estantes reserva franjas de alto
+uniforme, asi que una pieza fijada a mano en mitad de una franja la invalidaba
+entera y el resto de las copias se iba al fondo. Medido: fijar dos piezas en un
+pedido mezclado estiraba la plancha de 163 a 199 cm — 36 cm de pelicula tirados.
+
+Este acomodo coloca cada pieza en la posicion valida mas alta y, a igual altura,
+la mas a la izquierda ("bottom-left fill"). Las piezas fijadas son simples
+obstaculos: se rellena alrededor de ellas en vez de saltarlas.
 """
 
+import bisect
+
 _EPS = 1e-9
-_MAX_SCAN = 200
+_MAX_SCAN = 600      # tope de saltos horizontales por franja (anti bucle)
 
 
-def _blocking(x, y, w, h, rects, gap):
-    """Devuelve el rect fijo que invade (x,y,w,h) con separacion `gap`, o None."""
-    for r in rects:
-        if (x + w + gap > r["x"] + _EPS and r["x"] + r["w"] + gap > x + _EPS and
-                y + h + gap > r["y"] + _EPS and r["y"] + r["h"] + gap > y + _EPS):
-            return r
+class _Strip:
+    """Rectangulos ya colocados, ordenados por y, con consulta por franja."""
+
+    def __init__(self):
+        self.rects = []
+        self._ys = []
+        self._max_h = 0.0
+
+    def add(self, r):
+        i = bisect.bisect_left(self._ys, r["y"])
+        self.rects.insert(i, r)
+        self._ys.insert(i, r["y"])
+        self._max_h = max(self._max_h, r["h"])
+
+    def band(self, y, h, gap):
+        """Los rectangulos cuya franja vertical toca [y, y+h) con separacion gap."""
+        lo = bisect.bisect_left(self._ys, y - self._max_h - gap)
+        hi = bisect.bisect_right(self._ys, y + h + gap)
+        return [r for r in self.rects[lo:hi] if r["y"] + r["h"] + gap > y + _EPS]
+
+
+def _scan_x(band, x_min, x_max, w, gap):
+    """Primera x libre en la franja, o None si la pieza ya no cabe a lo ancho.
+
+    `band` solo trae rectangulos que estorban verticalmente, asi que aqui basta
+    con mirar la x: se salta al borde derecho del obstaculo mas lejano.
+    """
+    x = x_min
+    for _ in range(_MAX_SCAN):
+        if x + w > x_max + _EPS:
+            return None
+        tope = None
+        for r in band:
+            if r["x"] + r["w"] + gap > x + _EPS and x + w + gap > r["x"] + _EPS:
+                borde = r["x"] + r["w"]
+                if tope is None or borde > tope:
+                    tope = borde
+        if tope is None:
+            return x
+        x = tope + gap
     return None
 
 
 def pack(items, sheet_w, spacing=0.5, margin=0.5, allow_rotate=True, fixed=None):
-    """Acomoda los diseños y devuelve (colocaciones, largo_total_cm, no_caben).
+    """Acomoda los disenos y devuelve (colocaciones, largo_total_cm, no_caben).
 
     items: lista de dicts {uid, id, w, h, qty} en cm (solo las copias automaticas).
     fixed: lista de dicts {x, y, w, h, ...} ya colocados que hay que esquivar.
@@ -31,102 +71,87 @@ def pack(items, sheet_w, spacing=0.5, margin=0.5, allow_rotate=True, fixed=None)
     """
     fixed = fixed or []
     usable_w = sheet_w - 2 * margin
+    x_min, x_max = margin, margin + usable_w
+
     copies = []
     too_big = []
     for it in items:
         w, h = float(it["w"]), float(it["h"])
-        fits_normal = w <= usable_w
-        fits_rotated = allow_rotate and h <= usable_w
-        if not fits_normal and not fits_rotated:
+        if w > usable_w + _EPS and not (allow_rotate and h <= usable_w + _EPS):
             too_big.append(it["id"])
             continue
         for _ in range(int(it["qty"])):
             copies.append({"uid": it.get("uid"), "id": it["id"], "w": w, "h": h})
 
-    # Los mas altos primero para que los estantes queden parejos
-    copies.sort(key=lambda c: max(c["w"], c["h"]), reverse=True)
+    # Las mas grandes primero: dejan los huecos chicos para las piezas chicas.
+    copies.sort(key=lambda c: (-max(c["w"], c["h"]), -c["w"] * c["h"],
+                               str(c["id"]), str(c["uid"])))
 
-    shelves = []  # cada uno: {y, h, x} — siempre ordenados por y
-    placements = []
+    strip = _Strip()
+    ys = [margin]                      # alturas candidatas, ordenadas
+    ys_set = {margin}
+    # Por tamano de pieza, la altura mas alta que todavia puede servir. Una
+    # posicion que ya se descarto para ese tamano no vuelve a ser valida
+    # (solo se agregan piezas, nunca se quitan), asi que no hay que
+    # recorrer otra vez la plancha entera por cada copia.
+    pisos = {}
 
-    def scan_x(y, start_x, w, h):
-        """Primera x >= start_x donde (w,h) cabe sin chocar con piezas fijas."""
-        x = start_x
-        for _ in range(_MAX_SCAN):
-            if x + w > margin + usable_w + _EPS:
-                return None
-            b = _blocking(x, y, w, h, fixed, spacing)
-            if b is None:
-                return x
-            x = b["x"] + b["w"] + spacing
-        return None
-
-    def band_free(y, h):
-        """La franja [y, y+h) no pisa ningun estante ya creado."""
-        return not any(y < s["y"] + s["h"] - _EPS and s["y"] < y + h - _EPS
-                       for s in shelves)
-
-    def try_place(c):
-        orients = [(c["w"], c["h"], False)]
-        if allow_rotate and (c["w"] != c["h"]):
-            orients.append((c["h"], c["w"], True))
-
-        # 1) estantes existentes: el que menos altura desperdicie
-        best = None
-        for shelf in shelves:
-            for (w, h, rot) in orients:
-                if w > usable_w or h > shelf["h"] + _EPS:
-                    continue
-                x = scan_x(shelf["y"], shelf["x"], w, h)
-                if x is None:
-                    continue
-                waste = shelf["h"] - h
-                if best is None or waste < best[0]:
-                    best = (waste, shelf, x, w, h, rot)
-        if best:
-            _, shelf, x, w, h, rot = best
-            placements.append({"uid": c["uid"], "id": c["id"], "x": x,
-                               "y": shelf["y"], "w": w, "h": h, "rotated": rot})
-            shelf["x"] = x + w + spacing
+    def anota_y(v):
+        if v <= margin or v in ys_set:
             return
+        ys_set.add(v)
+        bisect.insort(ys, v)
+        # una altura nueva por encima de un piso si hay que volver a probarla
+        for k, piso in pisos.items():
+            if v < piso:
+                pisos[k] = v
 
-        # 2) estante nuevo: se prueban todos los huecos de arriba hacia abajo,
-        #    incluidos los que dejan las piezas fijadas. Sin esto, una pieza
-        #    fijada lejos empujaba el resto al fondo y estiraba la plancha.
-        cand = sorted((h, w, rot) for (w, h, rot) in orients if w <= usable_w)
-        h, w, rot = cand[0]
-        ys = {margin}
-        ys.update(s["y"] + s["h"] + spacing for s in shelves)
-        ys.update(r["y"] + r["h"] + spacing for r in fixed)
-        for y in sorted(ys):
-            if not band_free(y, h):
-                continue
-            x = scan_x(y, margin, w, h)
-            if x is not None:
-                shelves.append({"y": y, "h": h, "x": x + w + spacing})
-                shelves.sort(key=lambda s: s["y"])
-                placements.append({"uid": c["uid"], "id": c["id"], "x": x,
-                                   "y": y, "w": w, "h": h, "rotated": rot})
-                return
+    for r in fixed:
+        rect = {"x": float(r["x"]), "y": float(r["y"]),
+                "w": float(r["w"]), "h": float(r["h"])}
+        strip.add(rect)
+        anota_y(rect["y"])
+        anota_y(rect["y"] + rect["h"] + spacing)
 
-        # 3) ultimo recurso: debajo de absolutamente todo
-        y = max([margin] +
-                [s["y"] + s["h"] + spacing for s in shelves] +
-                [r["y"] + r["h"] + spacing for r in fixed])
-        shelves.append({"y": y, "h": h, "x": margin + w + spacing})
-        shelves.sort(key=lambda s: s["y"])
-        placements.append({"uid": c["uid"], "id": c["id"], "x": margin,
-                           "y": y, "w": w, "h": h, "rotated": rot})
-
+    placements = []
     for c in copies:
-        try_place(c)
+        orients = [(c["w"], c["h"], False)]
+        if allow_rotate and abs(c["w"] - c["h"]) > _EPS:
+            orients.append((c["h"], c["w"], True))
+        orients = [o for o in orients if o[0] <= usable_w + _EPS]
+        if not orients:
+            continue
+
+        elegido = None
+        tam = (c["w"], c["h"])
+        desde = bisect.bisect_left(ys, pisos.get(tam, margin))
+        for y in ys[desde:]:            # de arriba hacia abajo: la primera sirve
+            mejor = None
+            for (w, h, rot) in orients:
+                x = _scan_x(strip.band(y, h, spacing), x_min, x_max, w, spacing)
+                if x is not None and (mejor is None or x < mejor[0] - _EPS):
+                    mejor = (x, w, h, rot)
+            if mejor:
+                elegido = (y, *mejor)
+                break
+        if elegido is None:             # no cabe en ningun hueco: al fondo
+            fondo = max([margin] + [r["y"] + r["h"] + spacing for r in strip.rects])
+            w, h, rot = orients[0]
+            elegido = (fondo, x_min, w, h, rot)
+
+        y, x, w, h, rot = elegido
+        pisos[tam] = y
+        rect = {"uid": c["uid"], "id": c["id"], "x": x, "y": y,
+                "w": w, "h": h, "rotated": rot}
+        placements.append(rect)
+        strip.add(rect)
+        anota_y(y)
+        anota_y(y + h + spacing)
 
     bottom = 0.0
-    for p in placements:
-        bottom = max(bottom, p["y"] + p["h"])
-    for r in fixed:
+    for r in strip.rects:
         bottom = max(bottom, r["y"] + r["h"])
-    total_len = (bottom + margin) if (placements or fixed) else 0.0
+    total_len = (bottom + margin) if strip.rects else 0.0
     return placements, total_len, too_big
 
 
